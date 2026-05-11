@@ -2265,17 +2265,41 @@ def connect_iq_option():
         return False
 
 def connect_pocket_option():
+    """Connect to Pocket Option with robust error handling and verification."""
     global po_api, po_connected
     if not USE_POCKET_OPTION or not PO_API_AVAILABLE:
+        logger.warning("Pocket Option disabled or library not installed")
         return False
     if not PO_EMAIL:
+        logger.warning("PO_EMAIL not set - cannot connect")
         return False
     try:
         if PO_API_TYPE == 'stable_api':
             po_api = PocketOption(PO_EMAIL, PO_PASSWORD)
-            po_api.connect()
+            connected = po_api.connect()
+            # Some versions return bool, others return tuple
+            if isinstance(connected, tuple):
+                check, reason = connected
+                if not check:
+                    logger.error(f"Pocket Option connection failed: {reason}")
+                    po_api = None
+                    po_connected = False
+                    return False
+            elif connected is False:
+                logger.error("Pocket Option connection failed (returned False)")
+                po_api = None
+                po_connected = False
+                return False
             po_connected = True
-            logger.info("Pocket Option connected (pocketoptionapi)")
+            # Verify connection with test candle fetch
+            try:
+                test_candles = po_api.get_candles("EURUSD_OTC", 60, 5)
+                if test_candles and len(test_candles) > 0:
+                    logger.info(f"Pocket Option connected + verified - real candle data available ({len(test_candles)} candles)")
+                else:
+                    logger.warning("Pocket Option connected but candle test returned empty - OTC may not be available")
+            except Exception as e:
+                logger.warning(f"Pocket Option connected but candle test failed: {e}")
             return True
         else:
             logger.info("Pocket Option PyPI package - requires SSID auth")
@@ -2397,26 +2421,77 @@ def fetch_po_candles(symbol: str, tf: str, count: int = 120) -> Optional[pd.Data
         po_connected = False
         return None
 
-def get_data_sync(symbol, tf):
-    """Synchronous data fetch - tries IQ first (real OTC data), then PO, then demo fallback."""
-    # Priority 1: IQ Option (best OTC data source)
-    if iq_connected and iq_api is not None and USE_IQ_OPTION:
-        try:
-            df = fetch_iq_candles(symbol, tf)
-            if df is not None and len(df) >= 30:
-                return df
-        except:
-            pass
-    # Priority 2: Pocket Option
-    if po_connected and po_api is not None and USE_POCKET_OPTION:
-        try:
-            df = fetch_po_candles(symbol, tf)
-            if df is not None and len(df) >= 30:
-                return df
-        except:
-            pass
-    # Priority 3: Demo data fallback
-    logger.debug(f"No broker data for {symbol} {tf} - using demo")
+def get_data_sync(symbol, tf, platform=None):
+    """Synchronous data fetch - routes to the correct broker based on platform, then falls back.
+
+    Args:
+        symbol: Trading pair e.g. "EUR/USD (OTC)"
+        tf: Timeframe e.g. "1m", "5m", "30s"
+        platform: "IQ Option" or "Pocket Option". If None, tries IQ first then PO.
+
+    Logic:
+        - platform="IQ Option"     → IQ Option → PO fallback → demo
+        - platform="Pocket Option" → PO → IQ fallback → demo
+        - platform=None            → IQ Option → PO → demo (default)
+    """
+    # ── Platform-specific primary + fallback routing ────────────
+    if platform == "IQ Option":
+        # Primary: IQ Option
+        if iq_connected and iq_api is not None and USE_IQ_OPTION:
+            try:
+                df = fetch_iq_candles(symbol, tf)
+                if df is not None and len(df) >= 30:
+                    return df
+            except:
+                pass
+        # Fallback: Pocket Option
+        if po_connected and po_api is not None and USE_POCKET_OPTION:
+            try:
+                df = fetch_po_candles(symbol, tf)
+                if df is not None and len(df) >= 30:
+                    logger.info(f"PO fallback for IQ scan: {symbol} {tf}")
+                    return df
+            except:
+                pass
+
+    elif platform == "Pocket Option":
+        # Primary: Pocket Option
+        if po_connected and po_api is not None and USE_POCKET_OPTION:
+            try:
+                df = fetch_po_candles(symbol, tf)
+                if df is not None and len(df) >= 30:
+                    return df
+            except:
+                pass
+        # Fallback: IQ Option
+        if iq_connected and iq_api is not None and USE_IQ_OPTION:
+            try:
+                df = fetch_iq_candles(symbol, tf)
+                if df is not None and len(df) >= 30:
+                    logger.info(f"IQ fallback for PO scan: {symbol} {tf}")
+                    return df
+            except:
+                pass
+
+    else:
+        # No platform specified: IQ Option first (best OTC data), then PO
+        if iq_connected and iq_api is not None and USE_IQ_OPTION:
+            try:
+                df = fetch_iq_candles(symbol, tf)
+                if df is not None and len(df) >= 30:
+                    return df
+            except:
+                pass
+        if po_connected and po_api is not None and USE_POCKET_OPTION:
+            try:
+                df = fetch_po_candles(symbol, tf)
+                if df is not None and len(df) >= 30:
+                    return df
+            except:
+                pass
+
+    # Final fallback: Demo data
+    logger.debug(f"No broker data for {symbol} {tf} [{platform}] - using demo")
     return _demo_data(symbol, tf)
 
 def _demo_data(symbol, tf):
@@ -2483,7 +2558,7 @@ async def scan_loop():
                 higher_tf_trend = get_higher_tf_trend(sym)
                 if higher_tf_trend is None:
                     try:
-                        df_5m = await loop.run_in_executor(None, lambda s=sym: get_data_sync(s, '5m'))
+                        df_5m = await loop.run_in_executor(None, lambda s=sym, p=platform: get_data_sync(s, '5m', p))
                         if df_5m is not None and len(df_5m) >= 20:
                             trend_5m = compute_5m_trend(df_5m)
                             if trend_5m:
@@ -2495,7 +2570,7 @@ async def scan_loop():
                 market_trend = get_market_trend(sym)
                 if market_trend is None:
                     try:
-                        df_15m = await loop.run_in_executor(None, lambda s=sym: get_data_sync(s, '15m'))
+                        df_15m = await loop.run_in_executor(None, lambda s=sym, p=platform: get_data_sync(s, '15m', p))
                         if df_15m is not None and len(df_15m) >= 20:
                             trend_15m = compute_15m_trend(df_15m)
                             if trend_15m:
@@ -2510,7 +2585,7 @@ async def scan_loop():
                 for tf in tfs:
                     try:
                         tf_trend = higher_tf_trend if tf != '5m' else None
-                        df = await loop.run_in_executor(None, lambda s=sym, t=tf: get_data_sync(s, t))
+                        df = await loop.run_in_executor(None, lambda s=sym, t=tf, p=platform: get_data_sync(s, t, p))
                         if df is None or df.empty:
                             continue
 
