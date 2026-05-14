@@ -44,7 +44,7 @@ DEPLOY:
   Set TELEGRAM_TOKEN, TELEGRAM_CHAT_ID for alerts
   Set USE_IQ_OPTION=True / USE_POCKET_OPTION=True
   pip install -r requirements.txt
-  python catalyst_final.py
+  python catalyst_bots.py
   Open http://localhost:8000
 """
 import asyncio, json, sqlite3, logging, uuid, os, traceback, time, hashlib
@@ -123,7 +123,7 @@ except ImportError:
     TG_AVAILABLE = False
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("CatalystFinal")
+logger = logging.getLogger("CatalystBots")
 
 # ============================================================
 # 1. AUTO ERROR FIXER
@@ -564,34 +564,108 @@ def fvg_quality(df):
     return None
 
 # ============================================================
-# 2e. WYCKOFF PHASE DETECTION
+# 2e. WYCKOFF PHASE DETECTION (Enhanced)
 # ============================================================
 def detect_wyckoff_phase(df):
-    """Detect Wyckoff phase: accumulation, markup, distribution, markdown, or None."""
-    if len(df) < 30:
+    """
+    Returns 'accumulation', 'distribution', 'manipulation', or None.
+    - Accumulation: price near support, volume rising, range contracting.
+    - Distribution: price near resistance, volume falling, range contracting.
+    - Manipulation: false break of a support/resistance (liquidity grab).
+    """
+    if len(df) < 40:
         return None
-    close = df['close']
-    volume = df['volume']
-    ema20 = ema(close, 20).iloc[-1]
-    ema50 = ema(close, 50).iloc[-1] if len(close) >= 50 else ema20
-    price = close.iloc[-1]
-    avg_vol = volume.iloc[-20:].mean()
-    recent_vol = volume.iloc[-5:].mean()
-    price_range = df['high'].iloc[-20:].max() - df['low'].iloc[-20:].min()
-    price_avg = close.iloc[-20:].mean()
-    if price_avg == 0:
+
+    high = df['high'].values[-40:]
+    low  = df['low'].values[-40:]
+    close = df['close'].values[-40:]
+    volume = df['volume'].values[-40:]
+
+    # Range contraction (last 10 bars vs previous 10)
+    recent_range = np.mean(high[-10:] - low[-10:])
+    older_range  = np.mean(high[-20:-10] - low[-20:-10])
+    range_contracting = recent_range < older_range * 0.9
+
+    # Volume trend
+    recent_vol = np.mean(volume[-10:])
+    older_vol  = np.mean(volume[-20:-10])
+    vol_rising  = recent_vol > older_vol * 1.1
+    vol_falling = recent_vol < older_vol * 0.9
+
+    # Find swing points (order=3)
+    sh, sl = [], []
+    for i in range(3, 37):
+        if all(high[i] >= high[i-j] for j in range(1,4)) and all(high[i] >= high[i+j] for j in range(1,4)):
+            sh.append(i)
+        if all(low[i] <= low[i-j] for j in range(1,4)) and all(low[i] <= low[i+j] for j in range(1,4)):
+            sl.append(i)
+
+    if len(sh) < 2 or len(sl) < 2:
         return None
-    range_pct = price_range / price_avg * 100
-    if range_pct < 0.3 and recent_vol < avg_vol * 0.8:
-        if price < ema20:
-            return 'accumulation'
-        else:
-            return 'distribution'
-    if price > ema20 and ema20 > ema50 and recent_vol > avg_vol:
-        return 'markup'
-    if price < ema20 and ema20 < ema50 and recent_vol > avg_vol:
-        return 'markdown'
+
+    current_price = close[-1]
+    last_swing_high = high[sh[-1]]
+    last_swing_low  = low[sl[-1]]
+
+    # Accumulation (price near support, volume rising, range contracting)
+    if current_price <= last_swing_low * 1.002 and vol_rising and range_contracting:
+        return 'accumulation'
+
+    # Distribution (price near resistance, volume falling, range contracting)
+    if current_price >= last_swing_high * 0.998 and vol_falling and range_contracting:
+        return 'distribution'
+
+    # Manipulation – false break of support (bear trap → bullish)
+    if len(sl) >= 2:
+        prev_low = low[sl[-2]]
+        if low[sl[-1]] < prev_low and close[-1] > prev_low:
+            return 'manipulation'
+
+    # Manipulation – false break of resistance (bull trap → bearish)
+    if len(sh) >= 2:
+        prev_high = high[sh[-2]]
+        if high[sh[-1]] > prev_high and close[-1] < prev_high:
+            return 'manipulation'
+
     return None
+
+def wyckoff_confirms_signal(phase, direction):
+    """Returns True if the Wyckoff phase allows the trade direction."""
+    if phase is None:
+        return True                     # no phase → no restriction
+    if direction == 'BUY' and phase in ('accumulation', 'manipulation'):
+        return True
+    if direction == 'SELL' and phase in ('distribution', 'manipulation'):
+        return True
+    return False
+
+def detect_direction_bias(df, higher_tf_trend, market_trend):
+    """
+    Returns 'bullish', 'bearish', or 'neutral'.
+    Uses micro (1m EMA5/20), short-term (5m), and medium-term (15m) alignment.
+    """
+    if len(df) < 20:
+        return 'neutral'
+
+    ema5 = ema(df['close'], 5)
+    ema20 = ema(df['close'], 20)
+    micro = 'bullish' if ema5.iloc[-1] > ema20.iloc[-1] else ('bearish' if ema5.iloc[-1] < ema20.iloc[-1] else 'neutral')
+
+    # Count how many timeframes agree
+    signals = [micro]
+    if higher_tf_trend in ('bullish', 'bearish'):
+        signals.append(higher_tf_trend)
+    if market_trend in ('bullish', 'bearish'):
+        signals.append(market_trend)
+
+    bullish = sum(1 for s in signals if s == 'bullish')
+    bearish = sum(1 for s in signals if s == 'bearish')
+
+    if bullish >= 2:
+        return 'bullish'
+    elif bearish >= 2:
+        return 'bearish'
+    return 'neutral'
 
 # ============================================================
 # 2f. RSI DIVERGENCE
@@ -983,12 +1057,12 @@ def order_flow_direction(df):
 
 def wyckoff_phase_continuity(df, phase):
     """Check if Wyckoff phase supports the signal direction."""
-    if len(df) < 30:
+    if len(df) < 40:
         return False
     current_phase = detect_wyckoff_phase(df)
-    if phase == 'accumulation' and current_phase in ('accumulation', 'markup'):
+    if phase == 'accumulation' and current_phase in ('accumulation', 'manipulation'):
         return True
-    if phase == 'distribution' and current_phase in ('distribution', 'markdown'):
+    if phase == 'distribution' and current_phase in ('distribution', 'manipulation'):
         return True
     return False
 
@@ -1563,7 +1637,7 @@ async def send_telegram(signal: dict):
         # Signal status
         sig_status = 'HIGH PROBABILITY ONLY' if signal['confidence'] >= 85 else 'MODERATE PROBABILITY'
 
-        msg = f"""🔔 CATALYST AI SIGNAL!
+        msg = f"""🔔 CATALYSTBOTS SIGNAL!
 
 🎫 Trade: {sym}
 ⏳ Timer: {signal['timeframe']} (OTC)
@@ -1921,6 +1995,12 @@ def generate_signal(df, symbol="", higher_tf_trend=None, market_trend=None):
     # ---- SIGNAL DIRECTION ----
     direction = None
 
+    # --- Wyckoff Phase ---
+    wyckoff_phase = detect_wyckoff_phase(df)
+
+    # --- Direction Bias ---
+    bias = detect_direction_bias(df, higher_tf_trend, market_trend)
+
     # BUY ALL-AND conditions
     if (bull and rsi_val < PARAMS['rsi_buy'] and adx_val > PARAMS['adx_min'] and
         vol_spike and bb_sq and bb_exp and buy_sr and
@@ -1933,7 +2013,9 @@ def generate_signal(df, symbol="", higher_tf_trend=None, market_trend=None):
         (imbalance in ('bullish', None)) and
         (eq_hl in ('bullish', None)) and
         (vol_imb in ('bullish', None)) and
-        (rej_block != 'resistance')):
+        (rej_block != 'resistance') and
+        wyckoff_confirms_signal(wyckoff_phase, 'BUY') and
+        (bias == 'bullish' or bias == 'neutral')):
         direction = 'BUY'
 
     # SELL ALL-AND conditions
@@ -1948,7 +2030,9 @@ def generate_signal(df, symbol="", higher_tf_trend=None, market_trend=None):
         (imbalance in ('bearish', None)) and
         (eq_hl in ('bearish', None)) and
         (vol_imb in ('bearish', None)) and
-        (rej_block != 'support')):
+        (rej_block != 'support') and
+        wyckoff_confirms_signal(wyckoff_phase, 'SELL') and
+        (bias == 'bearish' or bias == 'neutral')):
         direction = 'SELL'
 
     if direction is None:
@@ -2034,8 +2118,9 @@ def generate_signal(df, symbol="", higher_tf_trend=None, market_trend=None):
     of = order_flow_direction(df)
     if (direction == 'BUY' and of == 'bullish') or (direction == 'SELL' and of == 'bearish'): score += 10
     wyckoff = detect_wyckoff_phase(df)
-    if direction == 'BUY' and wyckoff_phase_continuity(df, 'accumulation'): score += 10
-    if direction == 'SELL' and wyckoff_phase_continuity(df, 'distribution'): score += 10
+    if wyckoff_confirms_signal(wyckoff, direction): score += 10
+    if direction == 'BUY' and bias in ('bullish',): score += 10
+    if direction == 'SELL' and bias in ('bearish',): score += 10
 
     # Batch 3: Chart Patterns (bonus only)
     if direction == 'BUY':
@@ -2134,6 +2219,8 @@ def generate_signal(df, symbol="", higher_tf_trend=None, market_trend=None):
         'rejection_block': rej_block or 'None',
         'liquidity_side_det': liq_side_det or 'None',
         'atr_value': round(float(atr_val), 6) if not pd.isna(atr_val) else 0,
+        'wyckoff_phase': wyckoff_phase or 'None',
+        'direction_bias': bias or 'neutral',
     }
 
 def calculate_accuracy(direction, rsi_val, adx_val, vol_spike, bb_sq, bb_exp, sd, fvg_, struct, mss, reversal, cand_conf, mom_ok, mtf_ok, market_ok=True):
@@ -2794,7 +2881,7 @@ async def system_status():
     return {
         "status": "online",
         "version": "3.9",
-        "engine": "CATALYST FINAL",
+        "engine": "CATALYSTBOTS",
         "iq_connected": iq_connected,
         "po_connected": po_connected,
         "news_filter": NEWS_FILTER_ENABLED and EC_API_AVAILABLE,
@@ -2884,7 +2971,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>CATALYST v3.9</title>
+<title>CATALYSTBOTS v3.9</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -3026,7 +3113,8 @@ body{background:#050510;color:#e0e0e0;font-family:Segoe UI,sans-serif}
 <body>
 <div class="app">
 <div class="header">
-  <div class="logo">CATALYST<span>AI</span> <small style="font-size:0.4em;color:#888">v3.9</small></div>
+  <div class="logo">CATALYST<span>BOTS</span> <small style="font-size:0.4em;color:#888">v3.9</small></div>
+  <div style="font-size:0.7em;color:#888;margin-top:2px">below the smart money — <a href="https://CatabotAI.com" style="color:#00ff88;text-decoration:none">CatabotAI.com</a></div>
   <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
     <span class="session-badge session-active" id="session-badge">...</span>
     <span class="status" id="sys-status">LIVE</span>
@@ -3383,7 +3471,7 @@ function copySignal(btn){
   var rr=d.rr||'1:1.0';var smStructure=d.sm_structure||'No Clear Break';var smLiquidity=d.sm_liquidity||'N/A';
   var smBreakout=d.sm_breakout||'No Breakout';var smSignal=d.sm_signal||'N/A';
   var sigStatus=d.confidence>=85?'HIGH PROBABILITY ONLY':'MODERATE PROBABILITY';
-  var msg='CATALYST AI SIGNAL!\n\n'+
+  var msg='CATALYSTBOTS SIGNAL!\n\n'+
   'Trade: '+sym+'\n'+
   'Timer: '+d.timeframe+' (OTC)\n'+
   'Entry: '+entryStr+'\n'+
@@ -3468,7 +3556,7 @@ app.router.lifespan_context = lifespan
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    logger.info(f"Starting CATALYST FINAL v3.9 on port {port}")
+    logger.info(f"Starting CATALYSTBOTS v3.9 on port {port}")
     logger.info(f"IQ Email: {IQ_EMAIL}, PO Email: {PO_EMAIL}")
     logger.info(f"IQ Available: {IQ_API_AVAILABLE}, PO Available: {PO_API_AVAILABLE}")
     logger.info(f"Telegram: {TG_AVAILABLE}, News Filter: {EC_API_AVAILABLE}, Scheduler: {APS_AVAILABLE}")
